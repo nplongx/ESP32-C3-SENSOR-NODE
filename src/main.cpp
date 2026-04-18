@@ -10,10 +10,9 @@ const char *ssid = "Huynh Hong";
 const char *password = "123443215";
 const char *mqtt_server = "interchange.proxy.rlwy.net";
 const int mqtt_port = 50133;
-const char *device_id = "device_001"; // Bắt buộc phải khớp với Main Node
-const char *mqtt_user = "long";       // Thay bằng Username thực tế của Broker
-const char *mqtt_pass =
-    "53zx37kxq3epbexgqt6rjlce1d0e0gwq"; // Thay bằng Password thực tế của Broker
+const char *device_id = "device_001";
+const char *mqtt_user = "long";
+const char *mqtt_pass = "53zx37kxq3epbexgqt6rjlce1d0e0gwq";
 
 String topic_sensors = String("AGITECH/") + device_id + "/internal/sensors";
 String topic_config = String("AGITECH/") + device_id + "/internal/config";
@@ -31,10 +30,10 @@ PubSubClient client(espClient);
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// ================= CALIBRATION =================
+// ================= CALIBRATION & CONFIG =================
 #define MAX_WINDOW 50
 float ph_v7 = 2170.0, ph_v4 = 2800.0;
-float ec_factor = 0.88, ec_offset = 0.0, temp_compensation_beta = 0.0;
+float ec_factor = 0.88, ec_offset = 0.0;
 int ma_window = 10;
 
 #define V_REF_MV 3300.0
@@ -44,12 +43,19 @@ float temp_history[MAX_WINDOW], water_history[MAX_WINDOW];
 float ph_history[MAX_WINDOW], ec_history[MAX_WINDOW];
 int history_idx = 0;
 
+// Cờ bật/tắt cảm biến
 bool enable_ph = true;
 bool enable_ec = true;
 bool enable_temp = true;
 bool enable_water = true;
 
-// Các hàm đọc & tính toán (giữ nguyên logic gốc của bạn)
+// CỜ BÙ NHIỆT (Tách riêng biệt)
+bool enable_ec_tc = true;            // Bù nhiệt EC
+bool enable_ph_tc = true;            // Bù nhiệt pH
+float temp_compensation_beta = 0.02; // Hệ số 2% mỗi độ C cho EC (theo tài liệu)
+
+// ================= HÀM TIỆN ÍCH =================
+
 int read_adc_filtered(int pin) {
   int buffer[10];
   for (int i = 0; i < 10; i++) {
@@ -91,16 +97,32 @@ float readWaterLevel() {
   return (duration / 2.0) * 0.0343;
 }
 
-float calculate_ph(float voltage_mv) {
+// 🟢 TÍNH TOÁN pH (CÓ CƠ CHẾ BÙ NHIỆT THEO PHƯƠNG TRÌNH NERNST)
+float calculate_ph(float voltage_mv, float current_temp) {
   float diff = ph_v4 - ph_v7;
+  // Slope tại nhiệt độ chuẩn (giả sử hiệu chuẩn ở 25 độ C)
   float slope = (abs(diff) < 0.1) ? -0.006 : ((4.0 - 7.0) / diff);
+
+  // Nếu bật bù nhiệt pH, điều chỉnh slope theo nhiệt độ tuyệt đối (Kelvin)
+  if (enable_ph_tc) {
+    float temp_ratio = (current_temp + 273.15) / (25.0 + 273.15);
+    slope = slope / temp_ratio;
+  }
+
   return constrain(7.0 + slope * (voltage_mv - ph_v7), 0.0, 14.0);
 }
 
-float calculate_ec(float voltage_mv, float temp) {
+// 🟢 TÍNH TOÁN EC (CÓ CƠ CHẾ BÙ NHIỆT THEO TÀI LIỆU)
+float calculate_ec(float voltage_mv, float current_temp) {
+  // EC thô (mS/cm)
   float raw_ec = (voltage_mv / 1000.0) * ec_factor + ec_offset;
-  float coef = 1.0 + temp_compensation_beta * (temp - 25.0);
-  return max(raw_ec / coef, 0.0f);
+
+  if (enable_ec_tc) {
+    // Công thức: EC_compensated = EC_raw / (1 + 0.02 * (Temp - 25))
+    float coef = 1.0 + temp_compensation_beta * (current_temp - 25.0);
+    return max(raw_ec / coef, 0.0f);
+  }
+  return max(raw_ec, 0.0f);
 }
 
 // ================= MQTT CALLBACK (Nhận Config) =================
@@ -119,9 +141,10 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
       ec_factor = doc["ec_f"].as<float>();
     if (doc.containsKey("beta"))
       temp_compensation_beta = doc["beta"].as<float>();
-    if (doc.containsKey("ma_window")) {
+    if (doc.containsKey("ma_window"))
       ma_window = constrain(doc["ma_window"].as<int>(), 1, MAX_WINDOW);
-    }
+
+    // Đọc cờ cảm biến
     if (doc.containsKey("en_ph"))
       enable_ph = doc["en_ph"].as<bool>();
     if (doc.containsKey("en_ec"))
@@ -131,11 +154,17 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     if (doc.containsKey("en_water"))
       enable_water = doc["en_water"].as<bool>();
 
+    // Đọc cờ bù nhiệt
+    if (doc.containsKey("en_ec_tc"))
+      enable_ec_tc = doc["en_ec_tc"].as<bool>();
+    if (doc.containsKey("en_ph_tc"))
+      enable_ph_tc = doc["en_ph_tc"].as<bool>();
+
     Serial.println("🔄 Đã nạp cấu hình mới từ Main Node!");
   }
 }
 
-// ================= SETUP & LOOP =================
+// ================= SETUP & L00P =================
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_TRIG, OUTPUT);
@@ -145,10 +174,10 @@ void setup() {
   sensors.begin();
 
   for (int i = 0; i < MAX_WINDOW; i++) {
-    temp_history[i] = 25;
-    water_history[i] = 20;
-    ph_history[i] = 7;
-    ec_history[i] = 0;
+    temp_history[i] = 25.0;
+    water_history[i] = 20.0;
+    ph_history[i] = 7.0;
+    ec_history[i] = 0.0;
   }
 
   WiFi.begin(ssid, password);
@@ -159,9 +188,7 @@ void setup() {
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Đang kết nối MQTT...");
-
-    // 🟢 TẠO CLIENT ID DUY NHẤT (VD: SensorNode_device_001)
-    String clientId = "SensorNode_device_001";
+    String clientId = "SensorNode_";
     clientId += String(device_id);
 
     if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
@@ -191,51 +218,55 @@ void loop() {
 
   if (millis() - last_time >= 1000) {
     last_time = millis();
-    sensors.requestTemperatures();
 
-    float temp = temp_history[history_idx]; // Giữ nguyên giá trị cũ nếu bị tắt
+    // 1. ĐỌC NHIỆT ĐỘ ĐẦU TIÊN (Vì pH và EC đều cần nhiệt độ để bù)
+    float current_temp =
+        temp_history[(history_idx - 1 + ma_window) %
+                     ma_window]; // Lấy giá trị cũ gần nhất làm mặc định
     if (enable_temp) {
       sensors.requestTemperatures();
       float t = sensors.getTempCByIndex(0);
-      if (t >= -50 && t <= 125)
-        temp = t;
+      if (t >= -10 && t <= 80)
+        current_temp = t; // Lọc nhiễu dải đo hợp lý cho thủy canh
     }
 
-    float water = water_history[history_idx];
+    // 2. ĐỌC CÁC CẢM BIẾN KHÁC
+    float current_water =
+        water_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_water) {
       float w = readWaterLevel();
       if (w >= 0)
-        water = w;
+        current_water = w;
     }
 
-    float ph = ph_history[history_idx];
+    float current_ph = ph_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_ph) {
       float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV;
-      ph = calculate_ph(ph_mv);
+      current_ph =
+          calculate_ph(ph_mv, current_temp); // Truyền nhiệt độ vào để bù
     }
 
-    float ec = ec_history[history_idx];
+    float current_ec = ec_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_ec) {
       float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV;
-      ec = calculate_ec(ec_mv, temp);
+      current_ec =
+          calculate_ec(ec_mv, current_temp); // Truyền nhiệt độ vào để bù
     }
 
-    float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV;
-    float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV;
-
-    float avg_temp = calc_average(temp_history, temp);
-    float avg_water = calc_average(water_history, water);
-    float avg_ph = calc_average(ph_history, calculate_ph(ph_mv));
-    float avg_ec = calc_average(ec_history, calculate_ec(ec_mv, temp));
+    // 3. TÍNH TRUNG BÌNH MẢNG BỘ LỌC (Moving Average)
+    float avg_temp = calc_average(temp_history, current_temp);
+    float avg_water = calc_average(water_history, current_water);
+    float avg_ph = calc_average(ph_history, current_ph);
+    float avg_ec = calc_average(ec_history, current_ec);
 
     history_idx = (history_idx + 1) % ma_window;
 
-    // Đóng gói JSON gửi cho Main Node
+    // 4. GỬI DỮ LIỆU
     DynamicJsonDocument doc(256);
     doc["temp"] = avg_temp;
-    doc["water"] = avg_water;
+    doc["water_level"] = avg_water;
     doc["ph"] = avg_ph;
-    doc["ec"] = avg_ec;
+    doc["ec"] = avg_ec; // EC gửi lên đã là mS/cm và đã được bù nhiệt
 
     String payload;
     serializeJson(doc, payload);
