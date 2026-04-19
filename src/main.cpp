@@ -21,23 +21,28 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // ================= PIN MAPS =================
+// Cấu hình chân giữ nguyên - Hoàn toàn hợp lệ trên ESP32-C3
 #define PIN_DS18B20 2
 #define PIN_TRIG 3
 #define PIN_ECHO 4
-#define PIN_PH_ADC 0
-#define PIN_EC_ADC 1
+#define PIN_PH_ADC 0 // ADC1_CH0 trên ESP32-C3
+#define PIN_EC_ADC 1 // ADC1_CH1 trên ESP32-C3
 
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
 // ================= CALIBRATION & CONFIG =================
 #define MAX_WINDOW 50
-float ph_v7 = 2170.0, ph_v4 = 2800.0;
+
+// 🟢 Đã cập nhật cho pH-4502C (5V qua phân áp)
+// ph_v7 = 2500mV (Điểm 0 của mạch khi nối tắt rắc BNC)
+float ph_v7 = 2650.0, ph_v4 = 3555.0;
 float ec_factor = 0.88, ec_offset = 0.0;
 int ma_window = 10;
 
 #define V_REF_MV 3300.0
 #define ADC_MAX 4095.0
+#define VOLTAGE_DIVIDER_RATIO 1.5 // 🟢 Hệ số phân áp (Điện trở 10k và 20k)
 
 float temp_history[MAX_WINDOW], water_history[MAX_WINDOW];
 float ph_history[MAX_WINDOW], ec_history[MAX_WINDOW];
@@ -100,10 +105,9 @@ float readWaterLevel() {
 // 🟢 TÍNH TOÁN pH (CÓ CƠ CHẾ BÙ NHIỆT THEO PHƯƠNG TRÌNH NERNST)
 float calculate_ph(float voltage_mv, float current_temp) {
   float diff = ph_v4 - ph_v7;
-  // Slope tại nhiệt độ chuẩn (giả sử hiệu chuẩn ở 25 độ C)
+  // Module 4502C: pH thấp thì điện áp cao (Slope âm)
   float slope = (abs(diff) < 0.1) ? -0.006 : ((4.0 - 7.0) / diff);
 
-  // Nếu bật bù nhiệt pH, điều chỉnh slope theo nhiệt độ tuyệt đối (Kelvin)
   if (enable_ph_tc) {
     float temp_ratio = (current_temp + 273.15) / (25.0 + 273.15);
     slope = slope / temp_ratio;
@@ -144,7 +148,6 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     if (doc.containsKey("ma_window"))
       ma_window = constrain(doc["ma_window"].as<int>(), 1, MAX_WINDOW);
 
-    // Đọc cờ cảm biến
     if (doc.containsKey("en_ph"))
       enable_ph = doc["en_ph"].as<bool>();
     if (doc.containsKey("en_ec"))
@@ -154,7 +157,6 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     if (doc.containsKey("en_water"))
       enable_water = doc["en_water"].as<bool>();
 
-    // Đọc cờ bù nhiệt
     if (doc.containsKey("en_ec_tc"))
       enable_ec_tc = doc["en_ec_tc"].as<bool>();
     if (doc.containsKey("en_ph_tc"))
@@ -164,11 +166,13 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   }
 }
 
-// ================= SETUP & L00P =================
+// ================= SETUP & LOOP =================
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
+
+  // Cấu hình ADC cho ESP32-C3
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   sensors.begin();
@@ -219,15 +223,14 @@ void loop() {
   if (millis() - last_time >= 1000) {
     last_time = millis();
 
-    // 1. ĐỌC NHIỆT ĐỘ ĐẦU TIÊN (Vì pH và EC đều cần nhiệt độ để bù)
+    // 1. ĐỌC NHIỆT ĐỘ ĐẦU TIÊN
     float current_temp =
-        temp_history[(history_idx - 1 + ma_window) %
-                     ma_window]; // Lấy giá trị cũ gần nhất làm mặc định
+        temp_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_temp) {
       sensors.requestTemperatures();
       float t = sensors.getTempCByIndex(0);
       if (t >= -10 && t <= 80)
-        current_temp = t; // Lọc nhiễu dải đo hợp lý cho thủy canh
+        current_temp = t;
     }
 
     // 2. ĐỌC CÁC CẢM BIẾN KHÁC
@@ -241,19 +244,25 @@ void loop() {
 
     float current_ph = ph_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_ph) {
-      float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV;
-      current_ph =
-          calculate_ph(ph_mv, current_temp); // Truyền nhiệt độ vào để bù
+      // 🟢 Đã nhân thêm VOLTAGE_DIVIDER_RATIO để khôi phục điện áp 5V
+      float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV *
+                    VOLTAGE_DIVIDER_RATIO;
+      current_ph = calculate_ph(ph_mv, current_temp);
+
+      // 🟢 IN DEBUG mV CỦA pH RA SERIAL MONITOR
+      Serial.print("🛠️ DEBUG - pH mV (thực tếmtại cảm biến): ");
+      Serial.println(ph_mv);
     }
 
     float current_ec = ec_history[(history_idx - 1 + ma_window) % ma_window];
     if (enable_ec) {
-      float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV;
-      current_ec =
-          calculate_ec(ec_mv, current_temp); // Truyền nhiệt độ vào để bù
+      // 🟢 Đã nhân thêm VOLTAGE_DIVIDER_RATIO để khôi phục điện áp 5V
+      float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV *
+                    VOLTAGE_DIVIDER_RATIO;
+      current_ec = calculate_ec(ec_mv, current_temp);
     }
 
-    // 3. TÍNH TRUNG BÌNH MẢNG BỘ LỌC (Moving Average)
+    // 3. TÍNH TRUNG BÌNH MẢNG BỘ LỌC
     float avg_temp = calc_average(temp_history, current_temp);
     float avg_water = calc_average(water_history, current_water);
     float avg_ph = calc_average(ph_history, current_ph);
@@ -266,12 +275,14 @@ void loop() {
     doc["temp"] = avg_temp;
     doc["water_level"] = avg_water;
     doc["ph"] = avg_ph;
-    doc["ec"] = avg_ec; // EC gửi lên đã là mS/cm và đã được bù nhiệt
+    doc["ec"] = avg_ec;
 
     String payload;
     serializeJson(doc, payload);
     client.publish(topic_sensors.c_str(), payload.c_str());
 
     Serial.println("📡 Đã gửi: " + payload);
+    Serial.println(
+        "-----------------------------------"); // Đường kẻ vạch để dễ nhìn log
   }
 }
