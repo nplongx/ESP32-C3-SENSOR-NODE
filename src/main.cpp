@@ -16,6 +16,7 @@ const char *mqtt_pass = "53zx37kxq3epbexgqt6rjlce1d0e0gwq";
 
 String topic_sensors = String("AGITECH/") + device_id + "/sensors";
 String topic_config = String("AGITECH/") + device_id + "/sensors/config";
+String topic_cmd = String("AGITECH/") + device_id + "/sensor/command";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -35,17 +36,33 @@ DallasTemperature sensors(&oneWire);
 
 float ph_v7 = 2650.0, ph_v4 = 3555.0;
 float ec_factor = 0.88, ec_offset = 0.0;
-float temp_offset = 0.0; // 🟢 MỚI: Bù sai số nhiệt độ
-int ma_window = 10;
-int publish_interval = 1000; // 🟢 MỚI: Chu kỳ lấy mẫu và gửi dữ liệu (ms)
+float temp_offset = 0.0;
+
+// Các biến cấu hình từ xa
+int ma_window = 15;          // Mặc định CHUẨN (lọc trong 3 giây)
+int publish_interval = 5000; // Mặc định gửi 5s/lần
+
+float tank_height = 100.0;     // Độ cao bể (cm)
+bool continuous_level = false; // Cờ trạng thái đo liên tục (Bơm đang chạy)
 
 #define V_REF_MV 3300.0
 #define ADC_MAX 4095.0
 #define VOLTAGE_DIVIDER_RATIO 1.5
 
+// 🟢 MỚI: TỐC ĐỘ LẤY MẪU CỨNG
+const int SAMPLING_INTERVAL = 200; // Đọc cảm biến liên tục mỗi 200ms
+
+// Bộ đệm Lọc MA
 float temp_history[MAX_WINDOW], water_history[MAX_WINDOW];
 float ph_history[MAX_WINDOW], ec_history[MAX_WINDOW];
 int history_idx = 0;
+
+// Các biến lưu giá trị trung bình toàn cục
+float current_avg_temp = 25.0;
+float current_avg_water = 20.0;
+float current_avg_ph = 7.0;
+float current_avg_ec = 0.0;
+float latest_raw_water = 20.0; // Lưu riêng giá trị nước thô (tức thời)
 
 // Cờ bật/tắt cảm biến
 bool enable_ph = true;
@@ -53,7 +70,7 @@ bool enable_ec = true;
 bool enable_temp = true;
 bool enable_water = true;
 
-// CỜ BÙ NHIỆT (Tách riêng biệt)
+// CỜ BÙ NHIỆT
 bool enable_ec_tc = true;
 bool enable_ph_tc = true;
 float temp_compensation_beta = 0.02;
@@ -98,7 +115,10 @@ float readWaterLevel() {
   long duration = pulseIn(PIN_ECHO, HIGH, 20000);
   if (duration == 0)
     return -1;
-  return (duration / 2.0) * 0.0343;
+
+  float distance = (duration / 2.0) * 0.0343;
+  float water_level = tank_height - distance;
+  return (water_level < 0) ? 0 : water_level;
 }
 
 float calculate_ph(float voltage_mv, float current_temp) {
@@ -109,7 +129,6 @@ float calculate_ph(float voltage_mv, float current_temp) {
     float temp_ratio = (current_temp + 273.15) / (25.0 + 273.15);
     slope = slope / temp_ratio;
   }
-
   return constrain(7.0 + slope * (voltage_mv - ph_v7), 0.0, 14.0);
 }
 
@@ -123,85 +142,71 @@ float calculate_ec(float voltage_mv, float current_temp) {
   return max(raw_ec, 0.0f);
 }
 
-// ================= MQTT CALLBACK (Nhận Config) =================
+// ================= MQTT CALLBACK =================
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
   String message = "";
   for (int i = 0; i < length; i++)
     message += (char)payload[i];
 
-  // 🟢 Tăng buffer lên 1024 vì DeviceConfig gửi từ Controller chứa rất nhiều
-  // trường
-  DynamicJsonDocument doc(1024);
-  if (!deserializeJson(doc, message)) {
+  String topicStr = String(topic);
 
-    // --- Hiệu chuẩn cảm biến (Hỗ trợ cả key ngắn cũ và key chuẩn từ config.rs)
-    // ---
-    if (doc.containsKey("ph_v7"))
-      ph_v7 = doc["ph_v7"].as<float>();
-    if (doc.containsKey("ph_v4"))
-      ph_v4 = doc["ph_v4"].as<float>();
+  // XỬ LÝ LỆNH COMMAND TỪ CONTROLLER
+  if (topicStr == topic_cmd) {
+    DynamicJsonDocument doc(256);
+    if (!deserializeJson(doc, message)) {
+      if (doc.containsKey("command") && doc["command"] == "continuous_level") {
+        continuous_level = doc["state"].as<bool>();
+        Serial.print("🔄 Lệnh Controller -> Chế độ đo liên tục (Bơm): ");
+        Serial.println(continuous_level ? "BẬT" : "TẮT");
+      }
+    }
+    return;
+  }
 
-    if (doc.containsKey("ec_f"))
-      ec_factor = doc["ec_f"].as<float>();
-    else if (doc.containsKey("ec_factor"))
-      ec_factor = doc["ec_factor"].as<float>();
+  // XỬ LÝ CẤU HÌNH SENSOR
+  if (topicStr == topic_config) {
+    DynamicJsonDocument doc(1024);
+    if (!deserializeJson(doc, message)) {
 
-    if (doc.containsKey("ec_offset"))
-      ec_offset = doc["ec_offset"].as<float>();
-    if (doc.containsKey("temp_offset"))
-      temp_offset = doc["temp_offset"].as<float>();
+      if (doc.containsKey("ph_v7"))
+        ph_v7 = doc["ph_v7"].as<float>();
+      if (doc.containsKey("ph_v4"))
+        ph_v4 = doc["ph_v4"].as<float>();
 
-    if (doc.containsKey("beta"))
-      temp_compensation_beta = doc["beta"].as<float>();
-    else if (doc.containsKey("temp_compensation_beta"))
-      temp_compensation_beta = doc["temp_compensation_beta"].as<float>();
+      if (doc.containsKey("ec_factor"))
+        ec_factor = doc["ec_factor"].as<float>();
+      if (doc.containsKey("ec_offset"))
+        ec_offset = doc["ec_offset"].as<float>();
+      if (doc.containsKey("temp_offset"))
+        temp_offset = doc["temp_offset"].as<float>();
 
-    if (doc.containsKey("ma_window"))
-      ma_window = constrain(doc["ma_window"].as<int>(), 1, MAX_WINDOW);
-    else if (doc.containsKey("moving_average_window"))
-      ma_window =
-          constrain(doc["moving_average_window"].as<int>(), 1, MAX_WINDOW);
+      if (doc.containsKey("tank_height"))
+        tank_height = doc["tank_height"].as<float>();
+      if (doc.containsKey("temp_compensation_beta"))
+        temp_compensation_beta = doc["temp_compensation_beta"].as<float>();
 
-    if (doc.containsKey("publish_interval"))
-      publish_interval = doc["publish_interval"].as<int>();
+      if (doc.containsKey("moving_average_window"))
+        ma_window =
+            constrain(doc["moving_average_window"].as<int>(), 1, MAX_WINDOW);
 
-    // --- Cờ Bật/Tắt Cảm Biến ---
-    if (doc.containsKey("en_ph"))
-      enable_ph = doc["en_ph"].as<bool>();
-    else if (doc.containsKey("enable_ph_sensor"))
-      enable_ph = doc["enable_ph_sensor"].as<bool>();
+      if (doc.containsKey("publish_interval"))
+        publish_interval = doc["publish_interval"].as<int>();
 
-    if (doc.containsKey("en_ec"))
-      enable_ec = doc["en_ec"].as<bool>();
-    else if (doc.containsKey("enable_ec_sensor"))
-      enable_ec = doc["enable_ec_sensor"].as<bool>();
+      if (doc.containsKey("enable_ph_sensor"))
+        enable_ph = doc["enable_ph_sensor"].as<bool>();
+      if (doc.containsKey("enable_ec_sensor"))
+        enable_ec = doc["enable_ec_sensor"].as<bool>();
+      if (doc.containsKey("enable_temp_sensor"))
+        enable_temp = doc["enable_temp_sensor"].as<bool>();
+      if (doc.containsKey("enable_water_level_sensor"))
+        enable_water = doc["enable_water_level_sensor"].as<bool>();
 
-    if (doc.containsKey("en_temp"))
-      enable_temp = doc["en_temp"].as<bool>();
-    else if (doc.containsKey("enable_temp_sensor"))
-      enable_temp = doc["enable_temp_sensor"].as<bool>();
-
-    if (doc.containsKey("en_water"))
-      enable_water = doc["en_water"].as<bool>();
-    else if (doc.containsKey("enable_water_level_sensor"))
-      enable_water = doc["enable_water_level_sensor"].as<bool>();
-
-    // --- Cờ Bù Nhiệt ---
-    if (doc.containsKey("en_ec_tc"))
-      enable_ec_tc = doc["en_ec_tc"].as<bool>();
-    else if (doc.containsKey("enable_ec_tc"))
-      enable_ec_tc = doc["enable_ec_tc"].as<bool>();
-
-    if (doc.containsKey("en_ph_tc"))
-      enable_ph_tc = doc["en_ph_tc"].as<bool>();
-    else if (doc.containsKey("enable_ph_tc"))
-      enable_ph_tc = doc["enable_ph_tc"].as<bool>();
-
-    Serial.println("🔄 Đã nạp cấu hình mới từ Main Node!");
+      Serial.println("🔄 Đã nạp cấu hình Lõi mới từ Server!");
+    }
   }
 }
 
-// ================= SETUP & LOOP =================
+// ================= SETUP & TIMERS =================
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_TRIG, OUTPUT);
@@ -226,12 +231,12 @@ void setup() {
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Đang kết nối MQTT...");
-    String clientId = "SensorNode_";
-    clientId += String(device_id);
+    String clientId = "SensorNode_" + String(device_id);
 
     if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       Serial.println("Thành công!");
       client.subscribe(topic_config.c_str());
+      client.subscribe(topic_cmd.c_str());
     } else {
       Serial.print("Lỗi, rc=");
       Serial.print(client.state());
@@ -241,7 +246,9 @@ void reconnect() {
   }
 }
 
-unsigned long last_time = 0;
+// Khai báo 2 bộ đếm thời gian độc lập
+unsigned long last_sample_time = 0;
+unsigned long last_publish_time = 0;
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -254,62 +261,73 @@ void loop() {
     reconnect();
   client.loop();
 
-  // 🟢 MỚI: Sử dụng publish_interval nhận được từ config (mặc định 1000ms)
-  if (millis() - last_time >= publish_interval) {
-    last_time = millis();
+  unsigned long current_millis = millis();
 
-    // 1. ĐỌC NHIỆT ĐỘ ĐẦU TIÊN
-    float current_temp =
-        temp_history[(history_idx - 1 + ma_window) % ma_window];
+  // ==========================================
+  // LUỒNG 1: LẤY MẪU VÀ LỌC NHIỄU (Mỗi 200ms)
+  // ==========================================
+  if (current_millis - last_sample_time >= SAMPLING_INTERVAL) {
+    last_sample_time = current_millis;
+
+    // 1. Nhiệt độ
+    float raw_temp = current_avg_temp;
     if (enable_temp) {
       sensors.requestTemperatures();
       float t = sensors.getTempCByIndex(0);
-      if (t >= -10 && t <= 80) {
-        current_temp = t + temp_offset; // 🟢 MỚI: Bù sai số nhiệt độ
+      if (t >= -10 && t <= 80)
+        raw_temp = t + temp_offset;
+    }
+    current_avg_temp = calc_average(temp_history, raw_temp);
+
+    // 2. Mực nước
+    if (enable_water) {
+      float w = readWaterLevel();
+      if (w >= 0) {
+        latest_raw_water = w; // Cập nhật bản thô
+        current_avg_water = calc_average(water_history, w);
       }
     }
 
-    // 2. ĐỌC CÁC CẢM BIẾN KHÁC
-    float current_water =
-        water_history[(history_idx - 1 + ma_window) % ma_window];
-    if (enable_water) {
-      float w = readWaterLevel();
-      if (w >= 0)
-        current_water = w;
-    }
-
-    float current_ph = ph_history[(history_idx - 1 + ma_window) % ma_window];
+    // 3. pH (Bù nhiệt bằng Nhiệt độ Trung bình cho ổn định)
     if (enable_ph) {
       float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV *
                     VOLTAGE_DIVIDER_RATIO;
-      current_ph = calculate_ph(ph_mv, current_temp);
-
-      Serial.print("🛠️ DEBUG - pH mV (thực tế tại cảm biến): ");
-      Serial.println(ph_mv);
+      float ph_val = calculate_ph(ph_mv, current_avg_temp);
+      current_avg_ph = calc_average(ph_history, ph_val);
     }
 
-    float current_ec = ec_history[(history_idx - 1 + ma_window) % ma_window];
+    // 4. EC (Bù nhiệt bằng Nhiệt độ Trung bình)
     if (enable_ec) {
       float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV *
                     VOLTAGE_DIVIDER_RATIO;
-      current_ec = calculate_ec(
-          ec_mv, current_temp); // Công thức calculate_ec đã cộng ec_offset sẵn
+      float ec_val = calculate_ec(ec_mv, current_avg_temp);
+      current_avg_ec = calc_average(ec_history, ec_val);
     }
 
-    // 3. TÍNH TRUNG BÌNH MẢNG BỘ LỌC
-    float avg_temp = calc_average(temp_history, current_temp);
-    float avg_water = calc_average(water_history, current_water);
-    float avg_ph = calc_average(ph_history, current_ph);
-    float avg_ec = calc_average(ec_history, current_ec);
-
+    // Tăng index đệm MA (Chỉ tăng 1 lần sau khi đã nạp đủ 4 mảng)
     history_idx = (history_idx + 1) % ma_window;
+  }
 
-    // 4. GỬI DỮ LIỆU
+  // ==========================================
+  // LUỒNG 2: GỬI DỮ LIỆU LÊN SERVER (Publish)
+  // ==========================================
+  // Nếu Controller đang bơm (continuous_level = true), ép tốc độ gửi xuống
+  // 500ms
+  int current_pub_interval = continuous_level ? 500 : publish_interval;
+
+  if (current_millis - last_publish_time >= current_pub_interval) {
+    last_publish_time = current_millis;
+
     DynamicJsonDocument doc(256);
-    doc["temp"] = avg_temp;
-    doc["water_level"] = avg_water;
-    doc["ph"] = avg_ph;
-    doc["ec"] = avg_ec;
+    doc["temp"] = current_avg_temp;
+
+    // Khi đang bơm cấp/xả, lấy Mực nước thô để nhảy số sát thực tế nhất. Bình
+    // thường lấy số Đã Lọc.
+    doc["water_level"] =
+        continuous_level ? latest_raw_water : current_avg_water;
+
+    doc["ph"] = current_avg_ph;
+    doc["ec"] = current_avg_ec;
 
     String payload;
     serializeJson(doc, payload);
