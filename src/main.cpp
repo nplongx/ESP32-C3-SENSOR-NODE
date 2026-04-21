@@ -153,6 +153,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   // XỬ LÝ LỆNH COMMAND TỪ CONTROLLER
   if (topicStr == topic_cmd) {
     DynamicJsonDocument doc(256);
+
     if (!deserializeJson(doc, message)) {
       if (doc.containsKey("command") && doc["command"] == "continuous_level") {
         continuous_level = doc["state"].as<bool>();
@@ -167,6 +168,15 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   if (topicStr == topic_config) {
     DynamicJsonDocument doc(1024);
     if (!deserializeJson(doc, message)) {
+
+      DeserializationError error = deserializeJson(doc, message);
+
+      if (error) {
+        // Nếu lỗi sẽ in ra lý do tại đây
+        Serial.print("❌ Lỗi Parse JSON Config: ");
+        Serial.println(error.c_str());
+        return;
+      }
 
       if (doc.containsKey("ph_v7"))
         ph_v7 = doc["ph_v7"].as<float>();
@@ -224,6 +234,9 @@ void setup() {
   }
 
   WiFi.begin(ssid, password);
+
+  client.setBufferSize(1024);
+
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
 }
