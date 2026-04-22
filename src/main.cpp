@@ -322,7 +322,7 @@ unsigned long last_publish_time = 0;
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠️ [DEBUG] Mất kết nối WiFi, đang thử lại..."); // [DEBUG]
+    Serial.println("⚠️ [DEBUG] Mất kết nối WiFi, đang thử lại...");
     WiFi.disconnect();
     WiFi.reconnect();
     delay(5000);
@@ -334,6 +334,12 @@ void loop() {
 
   unsigned long current_millis = millis();
 
+  // Các biến cờ lỗi cục bộ trong vòng lặp này
+  static bool err_water_flag = false;
+  static bool err_temp_flag = false;
+  static bool err_ph_flag = false;
+  static bool err_ec_flag = false;
+
   // ==========================================
   // LUỒNG 1: LẤY MẪU VÀ LỌC NHIỄU (Mỗi 200ms)
   // ==========================================
@@ -342,50 +348,62 @@ void loop() {
 
     // 1. Nhiệt độ
     float raw_temp = current_avg_temp;
+    err_temp_flag = false; // Reset cờ lỗi
     if (enable_temp) {
       sensors.requestTemperatures();
       float t = sensors.getTempCByIndex(0);
-      if (t >= -10 && t <= 80)
+      // DEVICE_DISCONNECTED_C = -127.00
+      if (t > -50.0 && t <= 80.0) {
         raw_temp = t + temp_offset;
-      else
-        Serial.printf("⚠️ [DEBUG] Nhiệt độ lỗi hoặc ngoài vùng an toàn: %.2f\n",
-                      t); // [DEBUG]
+      } else {
+        err_temp_flag = true;
+        Serial.printf("⚠️ [DEBUG] Lỗi hoặc đứt cảm biến nhiệt độ: %.2f\n", t);
+      }
     }
     current_avg_temp = calc_average(temp_history, raw_temp);
 
     // 2. Mực nước
+    err_water_flag = false; // Reset cờ
     if (enable_water) {
       float w = readWaterLevel();
       if (w >= 0) {
-        latest_raw_water = w; // Cập nhật bản thô
+        latest_raw_water = w;
         current_avg_water = calc_average(water_history, w);
+      } else {
+        err_water_flag = true;
       }
     }
 
-    // 3. pH (Bù nhiệt bằng Nhiệt độ Trung bình cho ổn định)
+    // 3. pH
+    err_ph_flag = false; // Reset cờ
     if (enable_ph) {
-      float ph_mv = (read_adc_filtered(PIN_PH_ADC) / ADC_MAX) * V_REF_MV *
-                    VOLTAGE_DIVIDER_RATIO;
-      float ph_val = calculate_ph(ph_mv, current_avg_temp);
-      current_avg_ph = calc_average(ph_history, ph_val);
+      int adc_ph = read_adc_filtered(PIN_PH_ADC);
+      if (adc_ph <= 0 || adc_ph >= 4095) {
+        err_ph_flag = true; // Lỗi đứt dây tín hiệu hoặc chạm chập
+        Serial.println("⚠️ [DEBUG] Lỗi cảm biến pH: ADC rớt ngưỡng an toàn.");
+      } else {
+        float ph_mv = (adc_ph / ADC_MAX) * V_REF_MV * VOLTAGE_DIVIDER_RATIO;
+        float ph_val = calculate_ph(ph_mv, current_avg_temp);
+        current_avg_ph = calc_average(ph_history, ph_val);
+      }
     }
 
-    // 4. EC (Bù nhiệt bằng Nhiệt độ Trung bình)
+    // 4. EC
+    err_ec_flag = false; // Reset cờ
     if (enable_ec) {
-      float ec_mv = (read_adc_filtered(PIN_EC_ADC) / ADC_MAX) * V_REF_MV *
-                    VOLTAGE_DIVIDER_RATIO;
-      float ec_val = calculate_ec(ec_mv, current_avg_temp);
-      current_avg_ec = calc_average(ec_history, ec_val);
+      int adc_ec = read_adc_filtered(PIN_EC_ADC);
+      if (adc_ec <= 0 || adc_ec >= 4095) {
+        err_ec_flag = true;
+        Serial.println("⚠️ [DEBUG] Lỗi cảm biến EC: ADC rớt ngưỡng an toàn.");
+      } else {
+        float ec_mv = (adc_ec / ADC_MAX) * V_REF_MV * VOLTAGE_DIVIDER_RATIO;
+        float ec_val = calculate_ec(ec_mv, current_avg_temp);
+        current_avg_ec = calc_average(ec_history, ec_val);
+      }
     }
 
     // Tăng index đệm MA (Chỉ tăng 1 lần sau khi đã nạp đủ 4 mảng)
     history_idx = (history_idx + 1) % ma_window;
-
-    // [DEBUG] In ra giá trị trung bình sau mỗi lần lấy mẫu
-    // (Mình comment lại dòng này để tránh Serial trôi quá nhanh 5 lần/giây. Bạn
-    // có thể bỏ comment '//' để dùng) Serial.printf("📊 [MA Update] Temp: %.2f
-    // | Water: %.2f | pH: %.2f | EC: %.2f\n", current_avg_temp,
-    // current_avg_water, current_avg_ph, current_avg_ec);
   }
 
   // ==========================================
@@ -396,10 +414,10 @@ void loop() {
   if (current_millis - last_publish_time >= current_pub_interval) {
     last_publish_time = current_millis;
 
-    // Tăng kích thước buffer lên một chút vì thêm nhiều trường mới
     DynamicJsonDocument doc(512);
 
-    // 1. Dữ liệu cảm biến cốt lõi
+    // 1. Dữ liệu cảm biến cốt lõi (Gửi giá trị thô thay vì avg nếu bị lỗi nước
+    // liên tục)
     doc["temp"] = current_avg_temp;
     doc["water_level"] =
         continuous_level ? latest_raw_water : current_avg_water;
@@ -407,19 +425,17 @@ void loop() {
     doc["ec"] = current_avg_ec;
 
     // 2. Bổ sung Sức khỏe thiết bị (Device Health)
-    doc["rssi"] = WiFi.RSSI(); // Cường độ sóng WiFi (âm càng lớn sóng càng yếu)
-    doc["free_heap"] = ESP.getFreeHeap(); // RAM còn trống (bytes)
-    doc["uptime"] = millis() / 1000;      // Thời gian hoạt động (giây)
+    doc["rssi"] = WiFi.RSSI();
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis() / 1000;
 
-    // 3. Bổ sung Trạng thái cấu hình/Lệnh
-    doc["is_continuous"] = continuous_level; // Xác nhận lại chế độ đo liên tục
+    doc["is_continuous"] = continuous_level;
 
-    // 4. Cờ báo lỗi cảm biến (Ví dụ với cảm biến nước)
-    if (latest_raw_water == -1) {
-      doc["err_water"] = true; // Backend nhận được cờ này sẽ báo đỏ cảnh báo
-    } else {
-      doc["err_water"] = false;
-    }
+    // 3. Cờ báo lỗi của TOÀN BỘ CẢM BIẾN
+    doc["err_water"] = err_water_flag;
+    doc["err_temp"] = err_temp_flag;
+    doc["err_ph"] = err_ph_flag;
+    doc["err_ec"] = err_ec_flag;
 
     String payload;
     serializeJson(doc, payload);
