@@ -17,6 +17,7 @@ const char *mqtt_pass = "53zx37kxq3epbexgqt6rjlce1d0e0gwq";
 String topic_sensors = String("AGITECH/") + device_id + "/sensors";
 String topic_config = String("AGITECH/") + device_id + "/sensors/config";
 String topic_cmd = String("AGITECH/") + device_id + "/sensor/command";
+String topic_status = String("AGITECH/") + device_id + "/sensor/status";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -113,12 +114,22 @@ float readWaterLevel() {
   delayMicroseconds(20);
   digitalWrite(PIN_TRIG, LOW);
   long duration = pulseIn(PIN_ECHO, HIGH, 20000);
-  if (duration == 0)
+
+  if (duration == 0) {
+    Serial.println("⚠️ [DEBUG-Water] Không đọc được xung phản hồi (duration = "
+                   "0)"); // [DEBUG]
     return -1;
+  }
 
   float distance = (duration / 2.0) * 0.0343;
   float water_level = tank_height - distance;
-  return (water_level < 0) ? 0 : water_level;
+  float final_level = (water_level < 0) ? 0 : water_level;
+
+  // [DEBUG] Xem chi tiết cảm biến siêu âm
+  // Serial.printf("💧 [DEBUG-Water] Duration: %ld us | Distance: %.2f cm |
+  // Level thô: %.2f cm\n", duration, distance, final_level);
+
+  return final_level;
 }
 
 float calculate_ph(float voltage_mv, float current_temp) {
@@ -129,17 +140,31 @@ float calculate_ph(float voltage_mv, float current_temp) {
     float temp_ratio = (current_temp + 273.15) / (25.0 + 273.15);
     slope = slope / temp_ratio;
   }
-  return constrain(7.0 + slope * (voltage_mv - ph_v7), 0.0, 14.0);
+  float ph_result = constrain(7.0 + slope * (voltage_mv - ph_v7), 0.0, 14.0);
+
+  // [DEBUG]
+  Serial.printf("🧪 [DEBUG-pH] Volt: %.2f mV | Temp bù: %.2f °C | Slope: %.4f "
+                "| pH calc: %.2f\n",
+                voltage_mv, current_temp, slope, ph_result);
+
+  return ph_result;
 }
 
 float calculate_ec(float voltage_mv, float current_temp) {
   float raw_ec = (voltage_mv / 1000.0) * ec_factor + ec_offset;
+  float ec_result = raw_ec;
 
   if (enable_ec_tc) {
     float coef = 1.0 + temp_compensation_beta * (current_temp - 25.0);
-    return max(raw_ec / coef, 0.0f);
+    ec_result = raw_ec / coef;
   }
-  return max(raw_ec, 0.0f);
+  ec_result = max(ec_result, 0.0f);
+
+  // [DEBUG]
+  // Serial.printf("⚡ [DEBUG-EC] Volt: %.2f mV | Raw EC: %.2f | Temp bù: %.2f
+  // °C | EC calc: %.2f\n", voltage_mv, raw_ec, current_temp, ec_result);
+
+  return ec_result;
 }
 
 // ================= MQTT CALLBACK =================
@@ -149,6 +174,10 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     message += (char)payload[i];
 
   String topicStr = String(topic);
+
+  // [DEBUG] In ra mọi gói tin nhận được
+  Serial.printf("📥 [DEBUG-MQTT] Nhận Topic: %s\nPayload: %s\n",
+                topicStr.c_str(), message.c_str());
 
   // XỬ LÝ LỆNH COMMAND TỪ CONTROLLER
   if (topicStr == topic_cmd) {
@@ -160,6 +189,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
         Serial.print("🔄 Lệnh Controller -> Chế độ đo liên tục (Bơm): ");
         Serial.println(continuous_level ? "BẬT" : "TẮT");
       }
+    } else {
+      Serial.println("❌ [DEBUG] Lỗi Parse JSON Command!"); // [DEBUG]
     }
     return;
   }
@@ -167,63 +198,68 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   // XỬ LÝ CẤU HÌNH SENSOR
   if (topicStr == topic_config) {
     DynamicJsonDocument doc(1024);
-    if (!deserializeJson(doc, message)) {
+    DeserializationError error = deserializeJson(doc, message);
 
-      DeserializationError error = deserializeJson(doc, message);
-
-      if (error) {
-        // Nếu lỗi sẽ in ra lý do tại đây
-        Serial.print("❌ Lỗi Parse JSON Config: ");
-        Serial.println(error.c_str());
-        return;
-      }
-
-      if (doc.containsKey("ph_v7"))
-        ph_v7 = doc["ph_v7"].as<float>();
-      if (doc.containsKey("ph_v4"))
-        ph_v4 = doc["ph_v4"].as<float>();
-
-      if (doc.containsKey("ec_factor"))
-        ec_factor = doc["ec_factor"].as<float>();
-      if (doc.containsKey("ec_offset"))
-        ec_offset = doc["ec_offset"].as<float>();
-      if (doc.containsKey("temp_offset"))
-        temp_offset = doc["temp_offset"].as<float>();
-
-      if (doc.containsKey("tank_height"))
-        tank_height = doc["tank_height"].as<float>();
-      if (doc.containsKey("temp_compensation_beta"))
-        temp_compensation_beta = doc["temp_compensation_beta"].as<float>();
-
-      if (doc.containsKey("moving_average_window"))
-        ma_window =
-            constrain(doc["moving_average_window"].as<int>(), 1, MAX_WINDOW);
-
-      if (doc.containsKey("publish_interval"))
-        publish_interval = doc["publish_interval"].as<int>();
-
-      if (doc.containsKey("enable_ph_sensor"))
-        enable_ph = doc["enable_ph_sensor"].as<bool>();
-      if (doc.containsKey("enable_ec_sensor"))
-        enable_ec = doc["enable_ec_sensor"].as<bool>();
-      if (doc.containsKey("enable_temp_sensor"))
-        enable_temp = doc["enable_temp_sensor"].as<bool>();
-      if (doc.containsKey("enable_water_level_sensor"))
-        enable_water = doc["enable_water_level_sensor"].as<bool>();
-
-      Serial.println("🔄 Đã nạp cấu hình Lõi mới từ Server!");
+    if (error) {
+      // Nếu lỗi sẽ in ra lý do tại đây
+      Serial.print("❌ Lỗi Parse JSON Config: ");
+      Serial.println(error.c_str());
+      return;
     }
+
+    // [DEBUG] Bắt đầu đọc cấu hình mới
+    Serial.println("⚙️ [DEBUG] Đang nạp cấu hình mới...");
+
+    if (doc.containsKey("ph_v7"))
+      ph_v7 = doc["ph_v7"].as<float>();
+    if (doc.containsKey("ph_v4"))
+      ph_v4 = doc["ph_v4"].as<float>();
+
+    if (doc.containsKey("ec_factor"))
+      ec_factor = doc["ec_factor"].as<float>();
+    if (doc.containsKey("ec_offset"))
+      ec_offset = doc["ec_offset"].as<float>();
+    if (doc.containsKey("temp_offset"))
+      temp_offset = doc["temp_offset"].as<float>();
+
+    if (doc.containsKey("tank_height"))
+      tank_height = doc["tank_height"].as<float>();
+    if (doc.containsKey("temp_compensation_beta"))
+      temp_compensation_beta = doc["temp_compensation_beta"].as<float>();
+
+    if (doc.containsKey("moving_average_window"))
+      ma_window =
+          constrain(doc["moving_average_window"].as<int>(), 1, MAX_WINDOW);
+
+    if (doc.containsKey("publish_interval"))
+      publish_interval = doc["publish_interval"].as<int>();
+
+    if (doc.containsKey("enable_ph_sensor"))
+      enable_ph = doc["enable_ph_sensor"].as<bool>();
+    if (doc.containsKey("enable_ec_sensor"))
+      enable_ec = doc["enable_ec_sensor"].as<bool>();
+    if (doc.containsKey("enable_temp_sensor"))
+      enable_temp = doc["enable_temp_sensor"].as<bool>();
+    if (doc.containsKey("enable_water_level_sensor"))
+      enable_water = doc["enable_water_level_sensor"].as<bool>();
+
+    Serial.println("🔄 Đã nạp cấu hình Lõi mới từ Server thành công!");
   }
 }
 
 // ================= SETUP & TIMERS =================
 void setup() {
   Serial.begin(115200);
+  delay(1000); // [DEBUG] Đợi Serial Monitor sẵn sàng
+  Serial.println("\n\n🚀 Bắt đầu khởi động thiết bị..."); // [DEBUG]
+
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
+
+  Serial.println("🌡️ Khởi tạo cảm biến nhiệt độ..."); // [DEBUG]
   sensors.begin();
 
   for (int i = 0; i < MAX_WINDOW; i++) {
@@ -233,10 +269,17 @@ void setup() {
     ec_history[i] = 0.0;
   }
 
+  Serial.printf("🌐 Đang kết nối WiFi: %s...\n", ssid); // [DEBUG]
   WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { // [DEBUG] Chờ kết nối WiFi
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Kết nối WiFi thành công!"); // [DEBUG]
+  Serial.print("📡 IP Address: ");                 // [DEBUG]
+  Serial.println(WiFi.localIP());                  // [DEBUG]
 
   client.setBufferSize(1024);
-
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
 }
@@ -246,8 +289,22 @@ void reconnect() {
     Serial.print("Đang kết nối MQTT...");
     String clientId = "SensorNode_" + String(device_id);
 
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    // Cấu hình thông số LWT (Sẽ tự động gửi khi ESP32 mất kết nối đột ngột)
+    const char *willTopic = topic_status.c_str();
+    const char *willMessage = "{\"online\": false}";
+    int willQos = 1;
+    boolean willRetain = true; // Giữ lại bản tin cuối cùng trên Broker
+
+    // Sử dụng hàm connect có hỗ trợ LWT
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass, willTopic,
+                       willQos, willRetain, willMessage)) {
       Serial.println("Thành công!");
+
+      // Báo cáo trạng thái Online ngay khi kết nối thành công
+      client.publish(willTopic, "{\"online\": true}",
+                     true); // Tham số true ở cuối là để Retain bản tin
+
+      // Đăng ký nhận bản tin
       client.subscribe(topic_config.c_str());
       client.subscribe(topic_cmd.c_str());
     } else {
@@ -265,6 +322,7 @@ unsigned long last_publish_time = 0;
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ [DEBUG] Mất kết nối WiFi, đang thử lại..."); // [DEBUG]
     WiFi.disconnect();
     WiFi.reconnect();
     delay(5000);
@@ -289,6 +347,9 @@ void loop() {
       float t = sensors.getTempCByIndex(0);
       if (t >= -10 && t <= 80)
         raw_temp = t + temp_offset;
+      else
+        Serial.printf("⚠️ [DEBUG] Nhiệt độ lỗi hoặc ngoài vùng an toàn: %.2f\n",
+                      t); // [DEBUG]
     }
     current_avg_temp = calc_average(temp_history, raw_temp);
 
@@ -319,28 +380,46 @@ void loop() {
 
     // Tăng index đệm MA (Chỉ tăng 1 lần sau khi đã nạp đủ 4 mảng)
     history_idx = (history_idx + 1) % ma_window;
+
+    // [DEBUG] In ra giá trị trung bình sau mỗi lần lấy mẫu
+    // (Mình comment lại dòng này để tránh Serial trôi quá nhanh 5 lần/giây. Bạn
+    // có thể bỏ comment '//' để dùng) Serial.printf("📊 [MA Update] Temp: %.2f
+    // | Water: %.2f | pH: %.2f | EC: %.2f\n", current_avg_temp,
+    // current_avg_water, current_avg_ph, current_avg_ec);
   }
 
   // ==========================================
   // LUỒNG 2: GỬI DỮ LIỆU LÊN SERVER (Publish)
   // ==========================================
-  // Nếu Controller đang bơm (continuous_level = true), ép tốc độ gửi xuống
-  // 500ms
   int current_pub_interval = continuous_level ? 500 : publish_interval;
 
   if (current_millis - last_publish_time >= current_pub_interval) {
     last_publish_time = current_millis;
 
-    DynamicJsonDocument doc(256);
-    doc["temp"] = current_avg_temp;
+    // Tăng kích thước buffer lên một chút vì thêm nhiều trường mới
+    DynamicJsonDocument doc(512);
 
-    // Khi đang bơm cấp/xả, lấy Mực nước thô để nhảy số sát thực tế nhất. Bình
-    // thường lấy số Đã Lọc.
+    // 1. Dữ liệu cảm biến cốt lõi
+    doc["temp"] = current_avg_temp;
     doc["water_level"] =
         continuous_level ? latest_raw_water : current_avg_water;
-
     doc["ph"] = current_avg_ph;
     doc["ec"] = current_avg_ec;
+
+    // 2. Bổ sung Sức khỏe thiết bị (Device Health)
+    doc["rssi"] = WiFi.RSSI(); // Cường độ sóng WiFi (âm càng lớn sóng càng yếu)
+    doc["free_heap"] = ESP.getFreeHeap(); // RAM còn trống (bytes)
+    doc["uptime"] = millis() / 1000;      // Thời gian hoạt động (giây)
+
+    // 3. Bổ sung Trạng thái cấu hình/Lệnh
+    doc["is_continuous"] = continuous_level; // Xác nhận lại chế độ đo liên tục
+
+    // 4. Cờ báo lỗi cảm biến (Ví dụ với cảm biến nước)
+    if (latest_raw_water == -1) {
+      doc["err_water"] = true; // Backend nhận được cờ này sẽ báo đỏ cảnh báo
+    } else {
+      doc["err_water"] = false;
+    }
 
     String payload;
     serializeJson(doc, payload);
